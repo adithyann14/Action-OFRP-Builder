@@ -14,11 +14,11 @@ on:
       DEVICE_TREE_URL:
         description: 'DEVICE_TREE_URL'
         required: true
-        default: 'https://github.com/Adix256/recovery_xiaomi_pipa'
+        default: 'https://github.com/Adithy4n/recovery_device_xiaomi_pipa_AOSP'
       DEVICE_TREE_BRANCH:
         description: 'DEVICE_TREE_BRANCH'
         required: true
-        default: 'personal-beeld'
+        default: 'A-12.1' 
       DEVICE_PATH:
         description: 'DEVICE_PATH'
         required: true
