@@ -1,0 +1,325 @@
+name: Recovery Build
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  What changed from the original:
+#
+#  1. ccache via git repo  (adithyann14/ccahe)
+#     • Before building  → clone the repo, reassemble split chunks → ~/.ccache
+#     • After building   → compress ~/.ccache, split into 90 MB chunks,
+#                          force-push back (repo always stays ≈ 1 compressed
+#                          snapshot, no history bloat)
+#     • Needs secret:    GH_TOKEN  (PAT with repo-write on adithyann14/ccahe)
+#
+#  2. vendor_boot build   (always runs after the normal boot build)
+#     • Shares ALL compiled objects – Ninja skips anything already built.
+#     • Only the ramdisk assembly / image-packaging steps re-run (~2–5 min).
+#     • FOX_VENDOR_BOOT_RECOVERY=1 is exported only for this step; the
+#       vendorsetup.sh already handles the variant name ("vBaR").
+#     • No `make clean` before this step – that is intentional.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      SYNC_URL:
+        description: 'SYNC_URL'
+        required: true
+        default: 'https://gitlab.com/OrangeFox/sync.git'
+      MANIFEST_BRANCH:
+        description: 'MANIFEST_BRANCH'
+        required: true
+        default: '12.1'
+      DEVICE_TREE_URL:
+        description: 'DEVICE_TREE_URL'
+        required: true
+        default: 'https://github.com/Adithy4n/recovery_device_xiaomi_pipa_AOSP'
+      DEVICE_TREE_BRANCH:
+        description: 'DEVICE_TREE_BRANCH'
+        required: true
+        default: 'A-12.1'
+      DEVICE_PATH:
+        description: 'DEVICE_PATH'
+        required: true
+        default: 'device/xiaomi/pipa'
+      COMMON_TREE_URL:
+        description: 'COMMON_TREE_URL (if no common tree, leave blank)'
+        required: false
+      COMMON_PATH:
+        description: 'COMMON_PATH (if no common tree, leave blank)'
+        required: false
+      DEVICE_NAME:
+        description: 'DEVICE_NAME'
+        required: true
+        default: 'pipa'
+      MAKEFILE_NAME:
+        description: 'MAKEFILE_NAME'
+        required: true
+        default: 'twrp_pipa'
+      BUILD_TARGET:
+        description: 'BUILD_TARGET'
+        required: true
+        default: 'boot'
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+
+    # ── 1. Checkout this repo ────────────────────────────────────────────────
+    - name: Check Out
+      uses: actions/checkout@v4
+
+    # ── 2. Free disk space ───────────────────────────────────────────────────
+    - name: Cleanup
+      uses: rokibhasansagar/slimhub_actions@main
+
+    # ── 3. Create workspace folder ───────────────────────────────────────────
+    - name: Initialize workspace
+      id: pwd
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+
+    # ── 4. Restore ccache from the cache git repo ────────────────────────────
+    #
+    #  The ccache repo stores the compressed compiler-cache as a set of 90 MB
+    #  chunks (ccache_chunk_aa, ccache_chunk_ab, …).  We join them, untar into
+    #  ~/.ccache, and the build picks it up automatically via USE_CCACHE=1.
+    #
+    #  On the very first run the repo is empty → we start cold, which is fine.
+    #
+    - name: Restore ccache from cache repo
+      continue-on-error: true
+      run: |
+        CACHE_REPO="https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/adithyann14/ccahe.git"
+        echo "Cloning cache repo (shallow)…"
+        if git clone --depth=1 "$CACHE_REPO" /tmp/ccache_repo 2>/dev/null; then
+          CHUNKS=$(ls /tmp/ccache_repo/ccache_chunk_* 2>/dev/null | wc -l)
+          if [ "$CHUNKS" -gt 0 ]; then
+            echo "Found $CHUNKS chunk(s) — reassembling ccache archive…"
+            cat /tmp/ccache_repo/ccache_chunk_* > /tmp/ccache.tar.gz
+            mkdir -p "$HOME/.ccache"
+            tar -xzf /tmp/ccache.tar.gz -C "$HOME/.ccache" --strip-components=1
+            rm -f /tmp/ccache.tar.gz
+            echo "✅ ccache restored  ($(du -sh "$HOME/.ccache" | cut -f1))"
+          else
+            echo "ℹ️  Cache repo exists but has no chunks — cold start"
+          fi
+          rm -rf /tmp/ccache_repo
+        else
+          echo "ℹ️  Cache repo not reachable or empty — cold start"
+        fi
+
+    # ── 5. Build environment (apt + OrangeFox scripts) ───────────────────────
+    - name: Prepare the build environment
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        sudo apt update && sudo apt upgrade -y
+        DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
+            linux-modules-extra-$(uname -r) \
+            git python3 tar aria2 ccache
+        git clone https://gitlab.com/OrangeFox/misc/scripts
+        cd scripts
+        sudo bash setup/android_build_env.sh
+        sed -i 's/cd -/cd ../g' setup/install_android_sdk.sh
+        sudo bash setup/install_android_sdk.sh
+
+    # ── 6. Configure ccache ──────────────────────────────────────────────────
+    #
+    #  5 GB cap:  plenty for an OrangeFox recovery build and keeps the
+    #  compressed archive in the repo at a manageable size (~1–2 GB).
+    #
+    - name: Configure ccache
+      run: |
+        ccache --max-size=5G
+        ccache --set-config=compression=true
+        ccache --set-config=compression_level=5
+        ccache -z   # reset stats so the post-build summary is for this run only
+        echo "CCACHE_DIR=$HOME/.ccache"   >> $GITHUB_ENV
+        echo "USE_CCACHE=1"               >> $GITHUB_ENV
+        echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
+
+    # ── 7. Java ──────────────────────────────────────────────────────────────
+    - name: Install OpenJDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '11'
+
+    # ── 8. SSH (only if git@ URLs are used) ─────────────────────────────────
+    - name: Setup SSH Keys
+      if: |
+        startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
+        startsWith(github.event.inputs.COMMON_TREE_URL,  'git@github.com')
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    # ── 9. Sync OrangeFox manifest ───────────────────────────────────────────
+    - name: Sync OrangeFox sources and minimal manifest
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        git clone ${{ github.event.inputs.SYNC_URL }}
+        cd sync
+        ./orangefox_sync.sh \
+          --branch ${{ github.event.inputs.MANIFEST_BRANCH }} \
+          --path   ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+
+    # ── 10. Clone device tree ────────────────────────────────────────────────
+    - name: Clone device tree
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        cd fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} \
+          -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+          ./${{ github.event.inputs.DEVICE_PATH }}
+
+    # ── 11. Clone common tree (optional) ────────────────────────────────────
+    - name: Clone common tree
+      if: >
+        github.event.inputs.COMMON_TREE_URL != '' &&
+        github.event.inputs.COMMON_PATH     != ''
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        cd fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        git clone ${{ github.event.inputs.COMMON_TREE_URL }} \
+          -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+          ./${{ github.event.inputs.COMMON_PATH }}
+
+    # ── 12. Swap space ───────────────────────────────────────────────────────
+    - name: Set Swap Space
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 12
+
+    # ── 13. BUILD — boot image ───────────────────────────────────────────────
+    #
+    #  Standard recovery-as-boot build (FOX_VENDOR_BOOT_RECOVERY is NOT set).
+    #  `make clean` runs here and only here.
+    #
+    - name: Build boot image
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      continue-on-error: true
+      run: |
+        cd fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        set +e
+        source build/envsetup.sh
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export USE_CCACHE=1
+        export CCACHE_EXEC=$(which ccache)
+        set -e
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        make clean
+        mka adbd ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+
+    # ── 14. BUILD — vendor_boot image ────────────────────────────────────────
+    #
+    #  WHY no `make clean` here:
+    #    All C/C++ objects, the kernel binary, and recovery tools compiled in
+    #    step 13 are IDENTICAL for vendor_boot mode.  Ninja tracks inputs by
+    #    hash; only the ramdisk-assembly and image-packaging rules are dirtied
+    #    by the new BoardConfig flags (BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT
+    #    etc.).  Those packaging steps take ~2–5 minutes.  A clean would throw
+    #    away ~30–40 minutes of compiled work for no benefit.
+    #
+    #  ccache also guarantees that even if Ninja re-invokes a compiler for any
+    #  reason, the result comes from cache (near-zero time).
+    #
+    - name: Build vendor_boot image (reuses all compiled objects — no clean)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      continue-on-error: true
+      run: |
+        cd fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        set +e
+        source build/envsetup.sh
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export USE_CCACHE=1
+        export CCACHE_EXEC=$(which ccache)
+        export FOX_VENDOR_BOOT_RECOVERY=1   # switches vendorsetup.sh variant to "vBaR"
+        set -e
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        # intentionally NO make clean
+        mka vendorbootimage -j$(nproc --all)
+
+    # ── 15. ccache stats ─────────────────────────────────────────────────────
+    - name: ccache statistics
+      if: always()
+      run: |
+        echo "=== ccache stats for this run ==="
+        ccache -s
+
+    # ── 16. Save ccache back to the cache repo ───────────────────────────────
+    #
+    #  We always save (even on build failure) so that partial compilation work
+    #  is not wasted.  The repo is force-pushed so it stays a single commit
+    #  (no history bloat — old cache is simply replaced by the new one).
+    #
+    - name: Save ccache to cache repo
+      if: always()
+      continue-on-error: true
+      run: |
+        echo "Compressing ~/.ccache …"
+        tar -czf /tmp/ccache.tar.gz -C "$HOME" .ccache
+        echo "Compressed size: $(du -sh /tmp/ccache.tar.gz | cut -f1)"
+
+        CACHE_REPO="https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/adithyann14/ccahe.git"
+
+        # Clone or init repo
+        if ! git clone --depth=1 "$CACHE_REPO" /tmp/ccache_save 2>/dev/null; then
+          mkdir -p /tmp/ccache_save
+          cd /tmp/ccache_save
+          git init
+          git remote add origin "$CACHE_REPO"
+        fi
+
+        cd /tmp/ccache_save
+
+        # Remove old chunks and write new ones
+        rm -f ccache_chunk_*
+        split -b 90M /tmp/ccache.tar.gz ccache_chunk_
+        rm -f /tmp/ccache.tar.gz
+
+        CHUNKS=$(ls ccache_chunk_* | wc -l)
+        echo "Split into $CHUNKS × 90 MB chunks"
+
+        git config user.email "github-actions@github.com"
+        git config user.name  "GitHub Actions"
+        git add ccache_chunk_*
+
+        MSG="ccache: $(date '+%Y-%m-%d %H:%M UTC') | run #${{ github.run_id }} | $CHUNKS chunks"
+        git commit -m "$MSG" || echo "Nothing to commit"
+
+        # Force-push → the repo holds exactly one commit (current cache snapshot)
+        git push --force "$CACHE_REPO" HEAD:main 2>/dev/null || \
+        git push --force "$CACHE_REPO" HEAD:master          || \
+        echo "⚠️  Push failed — cache not saved this run"
+
+    # ── 17. List output directory ────────────────────────────────────────────
+    - name: Check output directory before uploading
+      run: |
+        echo "=== product root ==="
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/
+        echo ""
+        echo "=== device output ==="
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/
+
+    # ── 18. Upload release ───────────────────────────────────────────────────
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.img
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest : ${{ github.event.inputs.MANIFEST_BRANCH }}
+          Device   : ${{ github.event.inputs.DEVICE_NAME }}
+          Targets  : ${{ github.event.inputs.BUILD_TARGET }} + vendor_boot
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
