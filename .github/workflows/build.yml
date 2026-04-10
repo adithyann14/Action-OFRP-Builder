@@ -1,4 +1,4 @@
-name: Recovery Buildt
+name: Recovery Build 000000
 
 on:
   workflow_dispatch:
@@ -40,7 +40,7 @@ on:
       BUILD_TARGET:
         description: 'BUILD_TARGET'
         required: true
-        default: 'boot'
+        default: 'vendorboot'
 
 jobs:
   build:
@@ -64,7 +64,6 @@ jobs:
         cd workspace
         echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
 
-    # ccache binary lives here — restore MUST come after this step
     - name: Prepare the build environment
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
@@ -87,7 +86,7 @@ jobs:
     - name: Setup SSH Keys
       if: |
         startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
-        startsWith(github.event.inputs.COMMON_TREE_URL,  'git@github.com')
+        startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com')
       uses: webfactory/ssh-agent@v0.9.0
       with:
         ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -120,43 +119,57 @@ jobs:
           -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
           ./${{ github.event.inputs.COMMON_PATH }}
 
+    # ── Patch theme XMLs to native pipa resolution ────────────────────────────
+    # OrangeFox theme XMLs are hardcoded for 1080×1920.
+    # Patching to 1800×2880 makes scale factors 1.0×1.0 at runtime — no
+    # fractional scaling, no sub-pixel glitches in the status bar or anywhere.
+    - name: Patch theme XMLs (1080→1800, 1920→2880)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        FOX_DIR="fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
+
+        # Search both vendor/recovery and bootable/recovery theme folders
+        XML_FILES=$(find "$FOX_DIR/vendor" "$FOX_DIR/bootable" \
+          -type f \( -name "ui.xml" -o -name "splash.xml" \) 2>/dev/null || true)
+
+        if [ -z "$XML_FILES" ]; then
+          echo "WARNING: No ui.xml / splash.xml found — skipping patch"
+          exit 0
+        fi
+
+        for f in $XML_FILES; do
+          echo "Patching: $f"
+          # Patch 1920 first to avoid it being caught by the 1080 rule
+          # \b = word boundary so partial matches (e.g. 11920) are safe
+          sed -i -e 's/\b1920\b/2880/g' -e 's/\b1080\b/1800/g' "$f"
+        done
+        echo "Done. Patched $(echo "$XML_FILES" | wc -l) file(s)."
+
     - name: Set Swap Space
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 12
 
-    # ── RESTORE ccache — placed HERE so:
-    #    1. ccache binary is already installed (step above)
-    #    2. the full OrangeFox + device tree is synced, so toolchain paths
-    #       that form part of the compiler-hash key already exist on disk
-    #    3. no subsequent env-setup step can clobber ~/.ccache/ccache.conf
     - name: Restore ccache from cache repo
       continue-on-error: true
       run: |
         CACHE_REPO="https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/adithyann14/ccahe.git"
-        echo "Cloning cache repo (shallow)…"
         if git clone --depth=1 "$CACHE_REPO" /tmp/ccache_repo 2>/dev/null; then
           CHUNKS=$(ls /tmp/ccache_repo/ccache_chunk_* 2>/dev/null | wc -l)
           if [ "$CHUNKS" -gt 0 ]; then
-            echo "Found $CHUNKS chunk(s) — reassembling…"
             cat /tmp/ccache_repo/ccache_chunk_* > /tmp/ccache.tar.gz
             mkdir -p "$HOME/.ccache"
-            # Archive was created with:  tar -czf ... -C "$HOME" .ccache
-            # First path component inside tar is ".ccache"; strip it so
-            # contents land directly inside $HOME/.ccache/
             tar -xzf /tmp/ccache.tar.gz -C "$HOME/.ccache" --strip-components=1
             rm -f /tmp/ccache.tar.gz
             echo "ccache restored: $(du -sh $HOME/.ccache | cut -f1)"
           else
-            echo "Cache repo has no chunks — cold start"
+            echo "Cache repo empty — cold start"
           fi
           rm -rf /tmp/ccache_repo
         else
           echo "Cache repo not reachable — cold start"
         fi
 
-    # Configure after restore so --max-size only adjusts the limit, never
-    # clears the objects we just restored.  ccache -z resets stats only.
     - name: Configure ccache
       run: |
         ccache --max-size=5G
@@ -167,35 +180,27 @@ jobs:
         echo "USE_CCACHE=1"                >> $GITHUB_ENV
         echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
 
-    # ── BUILD: boot image ─────────────────────────────────────────────────────
+    # ── Build boot image ──────────────────────────────────────────────────────
     - name: Build boot image
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
       run: |
         cd fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        set +e
         source build/envsetup.sh
-        export ALLOW_MISSING_DEPENDENCIES=true
-        export USE_CCACHE=1
-        export CCACHE_EXEC=$(which ccache)
-        set -e
+        export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1 CCACHE_EXEC=$(which ccache)
         lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
         make clean
-        mka adbd ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        mka adbd bootimage -j$(nproc --all)
 
-    # ── BUILD: vendor_boot (no clean — reuses all compiled objects) ───────────
+    # ── Build vendor_boot image (no clean — shares all compiled objects) ──────
     - name: Build vendor_boot image
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
       run: |
         cd fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        set +e
         source build/envsetup.sh
-        export ALLOW_MISSING_DEPENDENCIES=true
-        export USE_CCACHE=1
-        export CCACHE_EXEC=$(which ccache)
+        export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1 CCACHE_EXEC=$(which ccache)
         export FOX_VENDOR_BOOT_RECOVERY=1
-        set -e
         lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
         mka vendorbootimage -j$(nproc --all)
 
@@ -203,41 +208,27 @@ jobs:
       if: always()
       run: ccache -s
 
-    # ── SAVE ccache back to repo (force-push = single-commit, no history bloat)
     - name: Save ccache to cache repo
       if: always()
       continue-on-error: true
       run: |
-        echo "Compressing ~/.ccache…"
         tar -czf /tmp/ccache.tar.gz -C "$HOME" .ccache
         echo "Compressed: $(du -sh /tmp/ccache.tar.gz | cut -f1)"
-
         CACHE_REPO="https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/adithyann14/ccahe.git"
-
-        if git clone --depth=1 "$CACHE_REPO" /tmp/ccache_save 2>/dev/null; then
-          echo "Cloned existing repo"
-        else
-          echo "Initialising new repo"
-          mkdir -p /tmp/ccache_save
-          cd /tmp/ccache_save
-          git init
-          git remote add origin "$CACHE_REPO"
+        if ! git clone --depth=1 "$CACHE_REPO" /tmp/ccache_save 2>/dev/null; then
+          mkdir -p /tmp/ccache_save && cd /tmp/ccache_save
+          git init && git remote add origin "$CACHE_REPO"
         fi
-
         cd /tmp/ccache_save
         rm -f ccache_chunk_*
         split -b 90M /tmp/ccache.tar.gz ccache_chunk_
         rm -f /tmp/ccache.tar.gz
-
         CHUNKS=$(ls ccache_chunk_* | wc -l)
-        echo "Split into $CHUNKS × 90 MB chunks"
-
         git config user.email "github-actions@github.com"
         git config user.name  "GitHub Actions"
         git add ccache_chunk_*
         git commit -m "ccache $(date '+%Y-%m-%d %H:%M UTC') run#${{ github.run_id }} ${CHUNKS}chunks" \
-          || echo "Nothing new to commit"
-
+          || echo "Nothing to commit"
         git push --force "$CACHE_REPO" HEAD:main    2>/dev/null \
           || git push --force "$CACHE_REPO" HEAD:master 2>/dev/null \
           || echo "Push failed"
@@ -258,6 +249,6 @@ jobs:
         body: |
           Manifest : ${{ github.event.inputs.MANIFEST_BRANCH }}
           Device   : ${{ github.event.inputs.DEVICE_NAME }}
-          Targets  : ${{ github.event.inputs.BUILD_TARGET }} + vendor_boot
+          Target   : boot + vendor_boot
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
