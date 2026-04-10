@@ -1,0 +1,226 @@
+name: Recovery Build nn
+
+on:
+  workflow_dispatch:
+    inputs:
+      SYNC_URL:
+        description: 'SYNC_URL'
+        required: true
+        default: 'https://gitlab.com/OrangeFox/sync.git'
+      MANIFEST_BRANCH:
+        description: 'MANIFEST_BRANCH'
+        required: true
+        default: '12.1'
+      DEVICE_TREE_URL:
+        description: 'DEVICE_TREE_URL'
+        required: true
+        default: 'https://github.com/Adithy4n/recovery_device_xiaomi_pipa_AOSP'
+      DEVICE_TREE_BRANCH:
+        description: 'DEVICE_TREE_BRANCH'
+        required: true
+        default: 'A-12.1'
+      DEVICE_PATH:
+        description: 'DEVICE_PATH'
+        required: true
+        default: 'device/xiaomi/pipa'
+      DEVICE_NAME:
+        description: 'DEVICE_NAME'
+        required: true
+        default: 'pipa'
+      MAKEFILE_NAME:
+        description: 'MAKEFILE_NAME'
+        required: true
+        default: 'twrp_pipa'
+      BUILD_TARGET:
+        description: 'BUILD_TARGET'
+        required: true
+        default: 'vendorboot'
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+
+    - name: Check Out
+      uses: actions/checkout@v4
+
+    - name: Cleanup
+      uses: rokibhasansagar/slimhub_actions@main
+
+    - name: Initialize workspace
+      id: pwd
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+
+    - name: Prepare the build environment
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        sudo apt update && sudo apt upgrade -y
+        DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
+            linux-modules-extra-$(uname -r) \
+            git python3 tar aria2 ccache
+        git clone https://gitlab.com/OrangeFox/misc/scripts
+        cd scripts
+        sudo bash setup/android_build_env.sh
+        sed -i 's/cd -/cd ../g' setup/install_android_sdk.sh
+        sudo bash setup/install_android_sdk.sh
+
+    - name: Install OpenJDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '11'
+
+    - name: Setup SSH Keys
+      if: |
+        startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
+        startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com')
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Sync OrangeFox sources and minimal manifest
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        git clone ${{ github.event.inputs.SYNC_URL }}
+        cd sync
+        ./orangefox_sync.sh \
+          --branch ${{ github.event.inputs.MANIFEST_BRANCH }} \
+          --path   ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+
+    - name: Clone device tree
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        cd fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} \
+          -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+          ./${{ github.event.inputs.DEVICE_PATH }}
+
+    # ── Patch theme XMLs to native pipa resolution ────────────────────────────
+    # OrangeFox theme XMLs are hardcoded for 1080×1920.
+    # Patching to 1800×2880 makes scale factors 1.0×1.0 at runtime — no
+    # fractional scaling, no sub-pixel glitches in the status bar or anywhere.
+    - name: Patch theme XMLs (1080→1800, 1920→2880)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        FOX_DIR="fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
+
+        # Search both vendor/recovery and bootable/recovery theme folders
+        XML_FILES=$(find "$FOX_DIR/vendor" "$FOX_DIR/bootable" \
+          -type f \( -name "ui.xml" -o -name "splash.xml" \) 2>/dev/null || true)
+
+        if [ -z "$XML_FILES" ]; then
+          echo "WARNING: No ui.xml / splash.xml found — skipping patch"
+          exit 0
+        fi
+
+        for f in $XML_FILES; do
+          echo "Patching: $f"
+          # Patch 1920 first to avoid it being caught by the 1080 rule
+          # \b = word boundary so partial matches (e.g. 11920) are safe
+          sed -i -e 's/\b1920\b/2880/g' -e 's/\b1080\b/1800/g' "$f"
+        done
+        echo "Done. Patched $(echo "$XML_FILES" | wc -l) file(s)."
+
+    - name: Set Swap Space
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 12
+
+    - name: Restore ccache from cache repo
+      continue-on-error: true
+      run: |
+        CACHE_REPO="https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/adithyann14/ccahe.git"
+        if git clone --depth=1 "$CACHE_REPO" /tmp/ccache_repo 2>/dev/null; then
+          CHUNKS=$(ls /tmp/ccache_repo/ccache_chunk_* 2>/dev/null | wc -l)
+          if [ "$CHUNKS" -gt 0 ]; then
+            cat /tmp/ccache_repo/ccache_chunk_* > /tmp/ccache.tar.gz
+            mkdir -p "$HOME/.ccache"
+            tar -xzf /tmp/ccache.tar.gz -C "$HOME/.ccache" --strip-components=1
+            rm -f /tmp/ccache.tar.gz
+            echo "ccache restored: $(du -sh $HOME/.ccache | cut -f1)"
+          else
+            echo "Cache repo empty — cold start"
+          fi
+          rm -rf /tmp/ccache_repo
+        else
+          echo "Cache repo not reachable — cold start"
+        fi
+
+    - name: Configure ccache
+      run: |
+        ccache --max-size=5G
+        ccache --set-config=compression=true
+        ccache --set-config=compression_level=5
+        ccache -z
+        echo "CCACHE_DIR=$HOME/.ccache"    >> $GITHUB_ENV
+        echo "USE_CCACHE=1"                >> $GITHUB_ENV
+        echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
+
+    # ── Build vendor_boot image (no clean — shares all compiled objects) ──────
+    - name: Build vendor_boot image
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      continue-on-error: true
+      run: |
+        cd fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        source build/envsetup.sh
+        export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1 CCACHE_EXEC=$(which ccache)
+        export FOX_VENDOR_BOOT_RECOVERY=1
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        make clean
+        mka vendorbootimage -j$(nproc --all)
+
+    - name: ccache statistics
+      if: always()
+      run: ccache -s
+
+    - name: Save ccache to cache repo
+      if: always()
+      continue-on-error: true
+      run: |
+        tar -czf /tmp/ccache.tar.gz -C "$HOME" .ccache
+        echo "Compressed: $(du -sh /tmp/ccache.tar.gz | cut -f1)"
+        CACHE_REPO="https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/adithyann14/ccahe.git"
+        if ! git clone --depth=1 "$CACHE_REPO" /tmp/ccache_save 2>/dev/null; then
+          mkdir -p /tmp/ccache_save && cd /tmp/ccache_save
+          git init && git remote add origin "$CACHE_REPO"
+        fi
+        cd /tmp/ccache_save
+        rm -f ccache_chunk_*
+        split -b 90M /tmp/ccache.tar.gz ccache_chunk_
+        rm -f /tmp/ccache.tar.gz
+        CHUNKS=$(ls ccache_chunk_* | wc -l)
+        git config user.email "github-actions@github.com"
+        git config user.name  "GitHub Actions"
+        git add ccache_chunk_*
+        git commit -m "ccache $(date '+%Y-%m-%d %H:%M UTC') run#${{ github.run_id }} ${CHUNKS}chunks" \
+          || echo "Nothing to commit"
+        git push --force "$CACHE_REPO" HEAD:main    2>/dev/null \
+          || git push --force "$CACHE_REPO" HEAD:master 2>/dev/null \
+          || echo "Push failed"
+
+    - name: Check output directory
+      run: |
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/ || true
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/ || true
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.img
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest : ${{ github.event.inputs.MANIFEST_BRANCH }}
+          Device   : ${{ github.event.inputs.DEVICE_NAME }}
+          Target   : boot + vendor_boot
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
