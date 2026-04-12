@@ -198,28 +198,27 @@ jobs:
         swap-size-gb: 12
 
 
-    - name: Patch theme XMLs (1080→1800, 1920→2880)
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-      run: |
-        FOX_DIR="fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
-
-        # Search both vendor/recovery and bootable/recovery theme folders
-        XML_FILES=$(find "$FOX_DIR/vendor" "$FOX_DIR/bootable" \
-          -type f \( -name "ui.xml" -o -name "splash.xml" \) 2>/dev/null || true)
-
-        if [ -z "$XML_FILES" ]; then
-          echo "WARNING: No ui.xml / splash.xml found — skipping patch"
-          exit 0
-        fi
-
-        for f in $XML_FILES; do
-          echo "Patching: $f"
-          # Patch 1920 first to avoid it being caught by the 1080 rule
-          # \b = word boundary so partial matches (e.g. 11920) are safe
-          sed -i -e 's/\b1920\b/2880/g' -e 's/\b1080\b/1800/g' "$f"
-        done
-        echo "Done. Patched $(echo "$XML_FILES" | wc -l) file(s)."
-
+#    - name: Patch theme XMLs (1080→1800, 1920→2880)
+#      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+#      run: |
+#        FOX_DIR="fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
+#
+#        # Search both vendor/recovery and bootable/recovery theme folders
+#        XML_FILES=$(find "$FOX_DIR/vendor" "$FOX_DIR/bootable" \
+#          -type f \( -name "ui.xml" -o -name "splash.xml" \) 2>/dev/null || true)
+#
+#        if [ -z "$XML_FILES" ]; then
+#          echo "WARNING: No ui.xml / splash.xml found — skipping patch"
+#          exit 0
+#        fi
+#
+#        for f in $XML_FILES; do
+#          echo "Patching: $f"
+#          # Patch 1920 first to avoid it being caught by the 1080 rule
+#          # \b = word boundary so partial matches (e.g. 11920) are safe
+#          sed -i -e 's/\b1920\b/2880/g' -e 's/\b1080\b/1800/g' "$f" #       done
+#        echo "Done. Patched $(echo "$XML_FILES" | wc -l) file(s)."
+#
 
 
 
