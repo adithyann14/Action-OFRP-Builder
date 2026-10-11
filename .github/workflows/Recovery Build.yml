@@ -46,7 +46,7 @@ jobs:
       DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
       DEVICE_PATH: device/xiaomi/sky
       DEVICE_NAME: sky
-      MAKEFILE_NAME: fox_sky-eng
+      MAKEFILE_NAME: ${{ inputs.manifest_branch == '16.0' && 'fox_sky-bp2a-eng' || 'fox_sky-eng' }}
       BUILD_TARGET: recovery
       TELEGRAM_CHAT_ID: ${{ inputs.notification_mode == 'quiet' && '-1002917930475' || '-1001480977582' }}
       TZ: Asia/Kolkata
