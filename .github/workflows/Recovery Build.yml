@@ -93,6 +93,12 @@ jobs:
         cd sync
         ./orangefox_sync.sh --branch ${{ env.MANIFEST_BRANCH }} --path "$GITHUB_WORKSPACE/fox_${{ env.MANIFEST_BRANCH }}"
 
+    - name: Default "unmount vendor" to off
+      run: |
+        f="fox_${{ env.MANIFEST_BRANCH }}/bootable/recovery/data.cpp"
+        sed -i 's#mPersist.SetValue(TW_UNMOUNT_VENDOR, "1");#mPersist.SetValue(TW_UNMOUNT_VENDOR, "0");#' "$f"
+        grep -n 'mPersist.SetValue(TW_UNMOUNT_VENDOR, "0");' "$f"
+
     - name: Prefer the classic zip signer
       run: |
         # zipsigner-3.0.jar rebuilds the whole archive through libziparchive,
