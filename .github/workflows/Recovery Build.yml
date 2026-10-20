@@ -72,9 +72,12 @@ jobs:
     - name: Prepare the build environment
       run: |
         /tmp/send_msg.sh "🧩 Preparing build environment..."
-        DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
-          linux-modules-extra-$(uname -r) \
+        DEBIAN_FRONTEND=noninteractive sudo apt-get update
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
           git python3 tar aria2 ccache
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+          linux-modules-extra-$(uname -r) || \
+          echo "linux-modules-extra-$(uname -r) unavailable; continuing without it"
         curl -L -O "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"
         sudo bash android_build_env.sh
 
