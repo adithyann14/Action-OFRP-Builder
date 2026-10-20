@@ -89,8 +89,29 @@ jobs:
     - name: Sync OrangeFox sources and minimal manifest
       run: |
         /tmp/send_msg.sh "🌐 Syncing OrangeFox sources..."
+        # fox_16.0 now pins Files/NAS projects that are private. The recovery
+        # build does not reference them, so drop them from the sync.
+        cat > /tmp/sky_build.xml <<'XML'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <manifest>
+          <remove-project name="external/libarchive" />
+          <remove-project name="external/libfuse3" />
+          <remove-project name="external/rclone" />
+          <remove-project name="external/fox-go" />
+        </manifest>
+        XML
         git clone --depth=1 ${{ env.SYNC_URL }} sync
         cd sync
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("orangefox_sync.sh")
+        s = p.read_text()
+        anchor = '        echo "-- Syncing all manifest-managed projects ...";'
+        if anchor not in s:
+            raise SystemExit("sync script anchor not found")
+        block = "        mkdir -p .repo/local_manifests\n        cp /tmp/sky_build.xml .repo/local_manifests/sky_build.xml\n"
+        p.write_text(s.replace(anchor, block + anchor, 1))
+        PY
         ./orangefox_sync.sh --branch ${{ env.MANIFEST_BRANCH }} --path "$GITHUB_WORKSPACE/fox_${{ env.MANIFEST_BRANCH }}"
 
     - name: Default "unmount vendor" to off
