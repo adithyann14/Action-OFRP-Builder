@@ -115,7 +115,16 @@ jobs:
         block = "        mkdir -p .repo/local_manifests\n        cp /tmp/sky_build.xml .repo/local_manifests/sky_build.xml\n"
         p.write_text(s.replace(anchor, block + anchor, 1))
         PY
-        ./orangefox_sync.sh --branch ${{ env.MANIFEST_BRANCH }} --path "$GITHUB_WORKSPACE/fox_${{ env.MANIFEST_BRANCH }}"
+        for attempt in 1 2 3; do
+          if ./orangefox_sync.sh --branch ${{ env.MANIFEST_BRANCH }} --path "$GITHUB_WORKSPACE/fox_${{ env.MANIFEST_BRANCH }}"; then
+            break
+          fi
+          if [ "$attempt" = 3 ]; then
+            exit 1
+          fi
+          echo "Sync attempt $attempt failed; retrying in 30s..."
+          sleep 30
+        done
 
     - name: Default "unmount vendor" to off
       run: |
