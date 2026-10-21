@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Recovery Build - OrangeFox recovery for xiaomi/sky
+# Shell conversion of the GitHub Actions workflow.
+#
+# Usage:
+#   ./recovery_build.sh [-u DEVICE_TREE_URL] [-b DEVICE_TREE_BRANCH] [-m MANIFEST_BRANCH]
+#
+#   -u  Device tree repository   (default: https://github.com/Adithy4n/recovery_device_xiaomi_sky.git)
+#   -b  Device tree branch       (default: fox_16.0)
+#   -m  OrangeFox manifest branch: 16.0 | 12.1   (default: 16.0)
+#
+# Optional env vars:
+#   WORKDIR       build directory            (default: current directory)
+#   SWAP_GB       swap size in GB, 0 = skip  (default: 30)
+#   UPLOAD        set to 1 to publish a GitHub release with `gh`
+#   GITHUB_REPO   owner/repo for the release (required if UPLOAD=1)
+
+set -euo pipefail
+
+# ---------------------------------------------------------------- inputs
+DEVICE_TREE_URL="https://github.com/Adithy4n/recovery_device_xiaomi_sky.git"
+DEVICE_TREE_BRANCH="fox_16.0"
+MANIFEST_BRANCH="16.0"
+
+while getopts "u:b:m:h" opt; do
+  case "$opt" in
+    u) DEVICE_TREE_URL="$OPTARG" ;;
+    b) DEVICE_TREE_BRANCH="$OPTARG" ;;
+    m) MANIFEST_BRANCH="$OPTARG" ;;
+    h|*) sed -n '2,17p' "$0"; exit 0 ;;
+  esac
+done
+
+case "$MANIFEST_BRANCH" in
+  16.0|12.1) ;;
+  *) echo "manifest branch must be 16.0 or 12.1" >&2; exit 1 ;;
+esac
+
+# ---------------------------------------------------------------- config
+SYNC_URL="https://gitlab.com/OrangeFox/sync.git"
+DEVICE_PATH="device/xiaomi/sky"
+DEVICE_NAME="sky"
+BUILD_TARGET="recovery"
+export TZ="Asia/Kolkata"
+
+if [ "$MANIFEST_BRANCH" = "16.0" ]; then
+  MAKEFILE_NAME="twrp_sky-bp2a-eng"
+else
+  MAKEFILE_NAME="twrp_sky-eng"
+fi
+
+WORKDIR="${WORKDIR:-$PWD}"
+SWAP_GB="${SWAP_GB:-30}"
+FOX_DIR="$WORKDIR/fox_${MANIFEST_BRANCH}"
+OUT_DIR="$FOX_DIR/out/target/product/$DEVICE_NAME"
+
+cd "$WORKDIR"
+
+# ---------------------------------------------------------------- prepare environment
+echo "==> Preparing the build environment"
+export DEBIAN_FRONTEND=noninteractive
+sudo apt-get update
+sudo apt-get install -yq git python3 tar aria2 ccache curl unzip
+sudo apt-get install -yq "linux-modules-extra-$(uname -r)" || \
+  echo "linux-modules-extra-$(uname -r) unavailable; continuing without it"
+
+curl -L -O "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"
+sudo bash android_build_env.sh
+
+# ---------------------------------------------------------------- OpenJDK 17 + 8
+echo "==> Installing OpenJDK 17 and 8"
+sudo apt-get install -yq openjdk-17-jdk openjdk-8-jdk
+
+JAVA_HOME_17_X64="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+for d in /usr/lib/jvm/java-17-openjdk-*; do [ -d "$d" ] && JAVA_HOME_17_X64="$d" && break; done
+JAVA_HOME_8_X64=""
+for d in /usr/lib/jvm/java-8-openjdk-*; do [ -d "$d" ] && JAVA_HOME_8_X64="$d" && break; done
+[ -n "$JAVA_HOME_8_X64" ] || { echo "Java 8 not found" >&2; exit 1; }
+
+export JAVA_HOME="$JAVA_HOME_17_X64"
+export PATH="$JAVA_HOME/bin:$PATH"
+
+# ---------------------------------------------------------------- sync sources
+echo "==> Syncing OrangeFox sources and minimal manifest"
+
+# fox_16.0 now pins Files/NAS projects that are private. The recovery
+# build does not reference them, so drop them from the sync.
+cat > /tmp/sky_build.xml <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remove-project name="external/libarchive" />
+  <remove-project name="external/libfuse3" />
+  <remove-project name="external/rclone" />
+  <remove-project name="external/fox-go" />
+</manifest>
+XML
+
+rm -rf sync
+git clone --depth=1 "$SYNC_URL" sync
+(
+  cd sync
+  python3 - <<'PY'
+from pathlib import Path
+p = Path("orangefox_sync.sh")
+s = p.read_text()
+anchor = '        echo "-- Syncing all manifest-managed projects ...";'
+if anchor not in s:
+    raise SystemExit("sync script anchor not found")
+block = "        mkdir -p .repo/local_manifests\n        cp /tmp/sky_build.xml .repo/local_manifests/sky_build.xml\n"
+p.write_text(s.replace(anchor, block + anchor, 1))
+PY
+  for attempt in 1 2 3; do
+    if ./orangefox_sync.sh --branch "$MANIFEST_BRANCH" --path "$FOX_DIR"; then
+      break
+    fi
+    if [ "$attempt" = 3 ]; then
+      exit 1
+    fi
+    echo "Sync attempt $attempt failed; retrying in 30s..."
+    sleep 30
+  done
+)
+
+# ---------------------------------------------------------------- patches
+echo "==> Defaulting \"unmount vendor\" to off"
+f="$FOX_DIR/bootable/recovery/data.cpp"
+sed -i 's#mPersist.SetValue(TW_UNMOUNT_VENDOR, "1");#mPersist.SetValue(TW_UNMOUNT_VENDOR, "0");#' "$f"
+grep -n 'mPersist.SetValue(TW_UNMOUNT_VENDOR, "0");' "$f"
+
+echo "==> Preferring the classic zip signer"
+# zipsigner-3.0.jar rebuilds the whole archive through libziparchive,
+# which has produced zips whose recovery.img entry fails to inflate
+# with "invalid code lengths set". The classic path (signapk +
+# zipadjust + minsignapk) only shifts offsets and injects the
+# signature block, so it never touches the compressed payload.
+SIG="$FOX_DIR/vendor/recovery/signature"
+if [ -f "$SIG/zipsigner-3.0.jar" ]; then
+  mv "$SIG/zipsigner-3.0.jar" "$SIG/zipsigner-3.0.jar.disabled"
+  echo "disabled zipsigner-3.0.jar, OrangeFox falls back to signapk + zipadjust"
+else
+  echo "zipsigner-3.0.jar not present, nothing to do"
+fi
+
+# ---------------------------------------------------------------- device tree
+echo "==> Cloning device tree"
+rm -rf "$FOX_DIR/$DEVICE_PATH"
+git clone --depth=1 "$DEVICE_TREE_URL" -b "$DEVICE_TREE_BRANCH" "$FOX_DIR/$DEVICE_PATH"
+DEVTREE_COMMIT="$(git -C "$FOX_DIR/$DEVICE_PATH" rev-parse --short=7 HEAD)"
+echo "device tree: $DEVTREE_COMMIT"
+
+# ---------------------------------------------------------------- swap
+if [ "$SWAP_GB" -gt 0 ] && ! swapon --show | grep -q '/swapfile-build'; then
+  echo "==> Setting ${SWAP_GB}G swap"
+  sudo fallocate -l "${SWAP_GB}G" /swapfile-build
+  sudo chmod 600 /swapfile-build
+  sudo mkswap /swapfile-build
+  sudo swapon /swapfile-build
+fi
+
+echo "==> System resources"
+nproc && free -h && df -h
+
+# ---------------------------------------------------------------- build
+echo "==> Building recovery"
+cd "$FOX_DIR"
+
+set +e +u
+# shellcheck disable=SC1091
+source build/envsetup.sh
+set -eu
+
+export ALLOW_MISSING_DEPENDENCIES=true
+# OrangeFox signs the flashable zip with the java 8 zipsigner, and
+# leaves it unsigned (unusable for a dirty flash) without a java 8
+export FOX_JAVA8_PATH="$JAVA_HOME_8_X64/bin/java"
+lunch "$MAKEFILE_NAME"
+
+mka adbd "${BUILD_TARGET}image" -j"$(nproc --all)"
+
+cd "$WORKDIR"
+
+# ---------------------------------------------------------------- verify zip
+echo "==> Verifying the flashable zip"
+rc=0
+shopt -s nullglob
+for z in "$OUT_DIR"/OrangeFox-*.zip; do
+  echo "### $(basename "$z"): $(stat -c%s "$z") bytes"
+  if unzip -t "$z" > /tmp/zt.log 2>&1; then
+    echo "### zip integrity: OK"
+  else
+    echo "### zip integrity: CORRUPT"
+    tail -30 /tmp/zt.log
+    rc=1
+  fi
+  ( cd "$(dirname "$z")" && md5sum "$(basename "$z")" | tee "$(basename "$z").md5" )
+done
+[ "$rc" -eq 0 ] || exit 1
+
+echo "==> Output directory"
+ls -l "$OUT_DIR/"
+
+# ---------------------------------------------------------------- optional release upload
+if [ "${UPLOAD:-0}" = "1" ]; then
+  : "${GITHUB_REPO:?set GITHUB_REPO=owner/repo to upload}"
+  command -v gh >/dev/null || sudo apt-get install -yq gh
+  TAG="build-$(date +%Y%m%d-%H%M%S)"
+  NOTES="Manifest: $MANIFEST_BRANCH
+Device: $DEVICE_NAME
+Device tree branch: $DEVICE_TREE_BRANCH
+Device tree commit: [$DEVTREE_COMMIT](${DEVICE_TREE_URL%.git}/tree/$DEVTREE_COMMIT)"
+  files=( "$OUT_DIR"/OrangeFox-R*.img "$OUT_DIR"/OrangeFox-R*.zip "$OUT_DIR"/OrangeFox-R*.zip.md5 )
+  gh release create "$TAG" "${files[@]}" \
+    --repo "$GITHUB_REPO" \
+    --title "$DEVICE_NAME-$DEVICE_TREE_BRANCH-$DEVTREE_COMMIT" \
+    --notes "$NOTES"
+fi
+
+echo "==> Done. Artifacts are in $OUT_DIR"
