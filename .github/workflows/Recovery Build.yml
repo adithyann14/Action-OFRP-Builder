@@ -4,14 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       device_tree_url:
-        description: "Device tree repository, for example https://github.com/anonytry/recovery_sky"
+        description: "Device tree repository"
         required: true
         type: string
+        default: https://github.com/Adithy4n/recovery_device_xiaomi_sky.git
 
       device_tree_branch:
         description: "Device tree branch"
         required: false
-        default: main
+        default: fox_16.0
         type: string
 
       manifest_branch:
@@ -22,15 +23,6 @@ on:
         options:
           - 16.0
           - 12.1
-
-      notification_mode:
-        description: "Telegram notification mode"
-        required: true
-        default: quiet
-        type: choice
-        options:
-          - quiet
-          - loud
 
 jobs:
   build:
@@ -46,32 +38,16 @@ jobs:
       DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
       DEVICE_PATH: device/xiaomi/sky
       DEVICE_NAME: sky
-      MAKEFILE_NAME: ${{ inputs.manifest_branch == '16.0' && 'fox_sky-bp2a-eng' || 'fox_sky-eng' }}
+      MAKEFILE_NAME: ${{ inputs.manifest_branch == '16.0' && 'twrp_sky-bp2a-eng' || 'twrp_sky-eng' }}
       BUILD_TARGET: recovery
-      TELEGRAM_CHAT_ID: ${{ inputs.notification_mode == 'quiet' && '-1002917930475' || '-1001480977582' }}
       TZ: Asia/Kolkata
 
     steps:
     - name: Cleanup
       uses: rokibhasansagar/slimhub_actions@main
 
-    - name: Create Telegram sender script
-      run: |
-        cat <<'EOF' > /tmp/send_msg.sh
-        #!/bin/bash
-        curl -s --fail \
-          -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-          -d chat_id="${{ env.TELEGRAM_CHAT_ID }}" \
-          -d text="$(printf "$1")" \
-          -d parse_mode="Markdown" \
-          -d disable_web_page_preview=true \
-        > /dev/null 2>&1 || true
-        EOF
-        chmod +x /tmp/send_msg.sh
-
     - name: Prepare the build environment
       run: |
-        /tmp/send_msg.sh "🧩 Preparing build environment..."
         DEBIAN_FRONTEND=noninteractive sudo apt-get update
         DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
           git python3 tar aria2 ccache
@@ -91,7 +67,6 @@ jobs:
 
     - name: Sync OrangeFox sources and minimal manifest
       run: |
-        /tmp/send_msg.sh "🌐 Syncing OrangeFox sources..."
         # fox_16.0 now pins Files/NAS projects that are private. The recovery
         # build does not reference them, so drop them from the sync.
         cat > /tmp/sky_build.xml <<'XML'
@@ -147,17 +122,8 @@ jobs:
           echo "zipsigner-3.0.jar not present, nothing to do"
         fi
 
-    - name: Get bootable/recovery commit
-      id: recovery_commit
-      run: |
-        cd "fox_${{ env.MANIFEST_BRANCH }}/bootable/recovery"
-        COMMIT=$(git rev-parse --short=7 HEAD)
-        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
-        echo "bootable/recovery: $COMMIT"
-
     - name: Clone device tree
       run: |
-        /tmp/send_msg.sh "🌲 Cloning device tree for \`${{ env.DEVICE_NAME }}\`..."
         git clone --depth=1 "${{ env.DEVICE_TREE_URL }}" \
           -b "${{ env.DEVICE_TREE_BRANCH }}" \
           "fox_${{ env.MANIFEST_BRANCH }}/${{ env.DEVICE_PATH }}"
@@ -181,7 +147,6 @@ jobs:
 
     - name: Build recovery
       run: |
-        /tmp/send_msg.sh "⚙️ Starting build for \`${{ env.DEVICE_NAME }}\`..."
         cd "fox_${{ env.MANIFEST_BRANCH }}"
 
         set +e
@@ -194,14 +159,7 @@ jobs:
         export FOX_JAVA8_PATH="$JAVA_HOME_8_X64/bin/java"
         lunch ${{ env.MAKEFILE_NAME }}
 
-        if ! mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all); then
-          /tmp/send_msg.sh "❌ Build failed for \`${{ env.DEVICE_NAME }}\` (\`${{ env.DEVICE_TREE_BRANCH }}\`)\n🔗 [Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-          exit 1
-        fi
-
-    - name: Notify build failure
-      if: failure()
-      run: /tmp/send_msg.sh "❌ Build failed for \`${{ env.DEVICE_NAME }}\` (\`${{ env.MANIFEST_BRANCH }}\`)\n🔗 [Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all)
 
     - name: Verify the flashable zip
       run: |
@@ -220,7 +178,7 @@ jobs:
           fi
           ( cd "$(dirname "$z")" && md5sum "$(basename "$z")" | tee "$(basename "$z").md5" )
         done
-        [ $rc -eq 0 ] || { /tmp/send_msg.sh "❌ Flashable zip failed \`unzip -t\`"; exit 1; }
+        [ $rc -eq 0 ] || exit 1
 
     - name: Check the output directory
       run: ls -l "fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/"
@@ -240,11 +198,5 @@ jobs:
           Device: ${{ env.DEVICE_NAME }}
           Device tree branch: ${{ env.DEVICE_TREE_BRANCH }}
           Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_URL }}/tree/${{ steps.devtree_commit.outputs.commit }})
-          bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://gitlab.com/OrangeFox/bootable/Recovery/tree/${{ steps.recovery_commit.outputs.commit }})
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Notify
-      if: success()
-      run: |
-        /tmp/send_msg.sh "📦 *Build complete!*\n🔗 [Download](https://github.com/${{ github.repository }}/releases/tag/${{ github.run_id }})\n🌲 Device tree: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_URL }}/tree/${{ steps.devtree_commit.outputs.commit }})\n🔁 bootable/recovery: [${{ steps.recovery_commit.outputs.commit }}](https://gitlab.com/OrangeFox/bootable/Recovery/tree/${{ steps.recovery_commit.outputs.commit }})"
