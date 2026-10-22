@@ -6,23 +6,14 @@ on:
       device_tree_url:
         description: "Device tree repository"
         required: true
-        type: string
         default: https://github.com/Adithy4n/recovery_device_xiaomi_sky.git
+        type: string
 
       device_tree_branch:
         description: "Device tree branch"
         required: false
         default: fox_16.0
         type: string
-
-      manifest_branch:
-        description: "OrangeFox manifest branch"
-        required: true
-        default: 16.0
-        type: choice
-        options:
-          - 16.0
-          - 12.1
 
 jobs:
   build:
@@ -33,12 +24,13 @@ jobs:
 
     env:
       SYNC_URL: https://gitlab.com/OrangeFox/sync.git
-      MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+      MANIFEST_BRANCH: "16.0"
       DEVICE_TREE_URL: ${{ inputs.device_tree_url }}
       DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
+      DEVICE_TREE_WEB: https://github.com/Adithy4n/recovery_device_xiaomi_sky
       DEVICE_PATH: device/xiaomi/sky
       DEVICE_NAME: sky
-      MAKEFILE_NAME: ${{ inputs.manifest_branch == '16.0' && 'twrp_sky-bp2a-eng' || 'twrp_sky-eng' }}
+      MAKEFILE_NAME: twrp_sky-bp2a-eng
       BUILD_TARGET: recovery
       TZ: Asia/Kolkata
 
@@ -122,6 +114,14 @@ jobs:
           echo "zipsigner-3.0.jar not present, nothing to do"
         fi
 
+    - name: Get bootable/recovery commit
+      id: recovery_commit
+      run: |
+        cd "fox_${{ env.MANIFEST_BRANCH }}/bootable/recovery"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "bootable/recovery: $COMMIT"
+
     - name: Clone device tree
       run: |
         git clone --depth=1 "${{ env.DEVICE_TREE_URL }}" \
@@ -178,7 +178,7 @@ jobs:
           fi
           ( cd "$(dirname "$z")" && md5sum "$(basename "$z")" | tee "$(basename "$z").md5" )
         done
-        [ $rc -eq 0 ] || exit 1
+        [ $rc -eq 0 ] || { echo "Flashable zip failed unzip -t"; exit 1; }
 
     - name: Check the output directory
       run: ls -l "fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/"
@@ -196,7 +196,9 @@ jobs:
         body: |
           Manifest: ${{ env.MANIFEST_BRANCH }}
           Device: ${{ env.DEVICE_NAME }}
+          Lunch: ${{ env.MAKEFILE_NAME }}
           Device tree branch: ${{ env.DEVICE_TREE_BRANCH }}
-          Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_URL }}/tree/${{ steps.devtree_commit.outputs.commit }})
+          Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_WEB }}/tree/${{ steps.devtree_commit.outputs.commit }})
+          bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://gitlab.com/OrangeFox/bootable/Recovery/tree/${{ steps.recovery_commit.outputs.commit }})
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
