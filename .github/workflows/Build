@@ -1,4 +1,4 @@
-name: Build
+name: Build skyyy
 
 on:
   workflow_dispatch:
