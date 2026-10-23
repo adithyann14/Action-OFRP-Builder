@@ -1,0 +1,300 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_tree_url:
+        description: "Device tree repository"
+        required: true
+        default: https://github.com/Adithy4n/recovery_device_xiaomi_sky.git
+        type: string
+
+      device_tree_branch:
+        description: "Device tree branch"
+        required: false
+        default: fox_16.0
+        type: string
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Cheap check (about 30 s). Catches a broken device tree BEFORE the runner
+  # spends hours on apt, repo sync and soong analysis.
+  # ---------------------------------------------------------------------------
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      DEVICE_TREE_URL: ${{ inputs.device_tree_url }}
+      DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
+      MAKEFILE_NAME: twrp_sky-bp2a-eng
+    steps:
+    - name: Clone and sanity-check the device tree
+      run: |
+        set -euo pipefail
+        git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" dt
+        cd dt
+        echo "device tree commit: $(git rev-parse --short=7 HEAD)"
+        fail=0
+
+        for f in AndroidProducts.mk BoardConfig.mk device.mk; do
+          if [ ! -f "$f" ]; then
+            echo "::error::$f is missing from the device tree"
+            fail=1
+          fi
+        done
+
+        prod="${MAKEFILE_NAME%%-*}"
+        if [ ! -f "$prod.mk" ]; then
+          echo "::error::lunch target $MAKEFILE_NAME needs $prod.mk, not found in the repo"
+          fail=1
+        fi
+
+        # every $(DEVICE_PATH)/... or $(LOCAL_PATH)/... file the .mk files use
+        while read -r ref; do
+          p="${ref#*)/}"
+          case "$p" in *%*|*'*'*|*'$'*) continue ;; esac
+          if [ ! -e "$p" ]; then
+            echo "::warning::referenced by a .mk file but missing in the repo: $p"
+          fi
+        done < <(grep -rhoE '\$\((LOCAL_PATH|DEVICE_PATH)\)/[A-Za-z0-9_./@+-]+' \
+                   --include=*.mk . | sort -u)
+
+        exit $fail
+
+  # ---------------------------------------------------------------------------
+  build:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    env:
+      SYNC_URL: https://gitlab.com/OrangeFox/sync.git
+      MANIFEST_BRANCH: "16.0"
+      DEVICE_TREE_URL: ${{ inputs.device_tree_url }}
+      DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
+      DEVICE_TREE_WEB: https://github.com/Adithy4n/recovery_device_xiaomi_sky
+      DEVICE_PATH: device/xiaomi/sky
+      DEVICE_NAME: sky
+      MAKEFILE_NAME: twrp_sky-bp2a-eng
+      BUILD_TARGET: recovery
+      TZ: Asia/Kolkata
+
+    steps:
+    - name: Cleanup
+      uses: rokibhasansagar/slimhub_actions@main
+
+    - name: Prepare the build environment
+      timeout-minutes: 60
+      run: |
+        # The Azure Ubuntu mirror sometimes crawls (last run: 274 MB at
+        # 42 kB/s = 1h48m). Retry with tight timeouts and fall back to other
+        # mirrors instead of waiting it out.
+        sudo tee /etc/apt/apt.conf.d/99fast >/dev/null <<'APT'
+        Acquire::Retries "5";
+        Acquire::http::Timeout "30";
+        Acquire::https::Timeout "30";
+        APT
+
+        set_mirror() {
+          if [ -n "$1" ]; then
+            printf '%s\tpriority:1\n' "$1" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update || true
+        }
+
+        install_all() {
+          set -e
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+            git python3 tar aria2 ccache
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+            linux-modules-extra-$(uname -r) || \
+            echo "linux-modules-extra-$(uname -r) unavailable; continuing without it"
+          curl -fL -O "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"
+          sudo bash android_build_env.sh
+        }
+        export -f install_all
+
+        done_ok=0
+        for mirror in "" \
+                      "http://mirrors.edge.kernel.org/ubuntu/" \
+                      "http://archive.ubuntu.com/ubuntu/" \
+                      "http://azure.archive.ubuntu.com/ubuntu/"; do
+          echo "=== apt attempt, mirror: ${mirror:-runner default}"
+          set_mirror "$mirror"
+          if timeout 15m bash -c install_all; then
+            done_ok=1
+            break
+          fi
+          echo "attempt failed or too slow; repairing dpkg and trying the next mirror"
+          sudo dpkg --configure -a || true
+        done
+        [ "$done_ok" = 1 ] || { echo "::error::could not install build dependencies"; exit 1; }
+
+    - name: Install OpenJDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'zulu'
+        java-version: |
+          17
+          8
+
+    - name: Sync OrangeFox sources and minimal manifest
+      timeout-minutes: 90
+      run: |
+        # fox_16.0 now pins Files/NAS projects that are private. The recovery
+        # build does not reference them, so drop them from the sync.
+        cat > /tmp/sky_build.xml <<'XML'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <manifest>
+          <remove-project name="external/libarchive" />
+          <remove-project name="external/libfuse3" />
+          <remove-project name="external/rclone" />
+          <remove-project name="external/fox-go" />
+        </manifest>
+        XML
+        git clone --depth=1 ${{ env.SYNC_URL }} sync
+        cd sync
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("orangefox_sync.sh")
+        s = p.read_text()
+        anchor = '        echo "-- Syncing all manifest-managed projects ...";'
+        if anchor not in s:
+            raise SystemExit("sync script anchor not found")
+        block = "        mkdir -p .repo/local_manifests\n        cp /tmp/sky_build.xml .repo/local_manifests/sky_build.xml\n"
+        p.write_text(s.replace(anchor, block + anchor, 1))
+        PY
+        for attempt in 1 2 3; do
+          if ./orangefox_sync.sh --branch ${{ env.MANIFEST_BRANCH }} --path "$GITHUB_WORKSPACE/fox_${{ env.MANIFEST_BRANCH }}"; then
+            break
+          fi
+          if [ "$attempt" = 3 ]; then
+            exit 1
+          fi
+          echo "Sync attempt $attempt failed; retrying in 30s..."
+          sleep 30
+        done
+
+    - name: Default "unmount vendor" to off
+      run: |
+        f="fox_${{ env.MANIFEST_BRANCH }}/bootable/recovery/data.cpp"
+        sed -i 's#mPersist.SetValue(TW_UNMOUNT_VENDOR, "1");#mPersist.SetValue(TW_UNMOUNT_VENDOR, "0");#' "$f"
+        grep -n 'mPersist.SetValue(TW_UNMOUNT_VENDOR, "0");' "$f"
+
+    - name: Prefer the classic zip signer
+      run: |
+        # zipsigner-3.0.jar rebuilds the whole archive through libziparchive,
+        # which has produced zips whose recovery.img entry fails to inflate
+        # with "invalid code lengths set". The classic path (signapk +
+        # zipadjust + minsignapk) only shifts offsets and injects the
+        # signature block, so it never touches the compressed payload.
+        SIG="fox_${{ env.MANIFEST_BRANCH }}/vendor/recovery/signature"
+        if [ -f "$SIG/zipsigner-3.0.jar" ]; then
+          mv "$SIG/zipsigner-3.0.jar" "$SIG/zipsigner-3.0.jar.disabled"
+          echo "disabled zipsigner-3.0.jar, OrangeFox falls back to signapk + zipadjust"
+        else
+          echo "zipsigner-3.0.jar not present, nothing to do"
+        fi
+
+    - name: Get bootable/recovery commit
+      id: recovery_commit
+      run: |
+        cd "fox_${{ env.MANIFEST_BRANCH }}/bootable/recovery"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "bootable/recovery: $COMMIT"
+
+    - name: Clone device tree
+      run: |
+        git clone --depth=1 "${{ env.DEVICE_TREE_URL }}" \
+          -b "${{ env.DEVICE_TREE_BRANCH }}" \
+          "fox_${{ env.MANIFEST_BRANCH }}/${{ env.DEVICE_PATH }}"
+
+    - name: Get device tree commit
+      id: devtree_commit
+      run: |
+        cd "fox_${{ env.MANIFEST_BRANCH }}/${{ env.DEVICE_PATH }}"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "device tree: $COMMIT"
+
+    - name: Set swap space
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 30
+
+    - name: Show system resources
+      run: |
+        nproc && free -h && df -h
+
+    - name: Build recovery
+      timeout-minutes: 240
+      run: |
+        cd "fox_${{ env.MANIFEST_BRANCH }}"
+
+        set +e
+        source build/envsetup.sh
+        set -e
+
+        export ALLOW_MISSING_DEPENDENCIES=true
+        # OrangeFox signs the flashable zip with the java 8 zipsigner, and
+        # leaves it unsigned (unusable for a dirty flash) without a java 8
+        export FOX_JAVA8_PATH="$JAVA_HOME_8_X64/bin/java"
+        lunch ${{ env.MAKEFILE_NAME }}
+
+        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all)
+
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          fox_${{ env.MANIFEST_BRANCH }}/out/error.log
+          fox_${{ env.MANIFEST_BRANCH }}/out/verbose.log.gz
+          fox_${{ env.MANIFEST_BRANCH }}/out/soong.log
+        if-no-files-found: ignore
+
+    - name: Verify the flashable zip
+      run: |
+        set +e
+        D="fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}"
+        rc=0
+        shopt -s nullglob
+        for z in "$D"/OrangeFox-*.zip; do
+          echo "### $(basename "$z"): $(stat -c%s "$z") bytes"
+          if unzip -t "$z" > /tmp/zt.log 2>&1; then
+            echo "### zip integrity: OK"
+          else
+            echo "### zip integrity: CORRUPT"
+            tail -30 /tmp/zt.log
+            rc=1
+          fi
+          ( cd "$(dirname "$z")" && md5sum "$(basename "$z")" | tee "$(basename "$z").md5" )
+        done
+        [ $rc -eq 0 ] || { echo "Flashable zip failed unzip -t"; exit 1; }
+
+    - name: Check the output directory
+      run: ls -l "fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/"
+
+    - name: Upload to release
+      uses: softprops/action-gh-release@v3
+      with:
+        files: |
+          fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/OrangeFox-R*.img
+          fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/OrangeFox-R*.zip
+          fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/OrangeFox-R*.zip.md5
+        fail_on_unmatched_files: false
+        name: ${{ env.DEVICE_NAME }}-${{ env.DEVICE_TREE_BRANCH }}-${{ steps.devtree_commit.outputs.commit }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest: ${{ env.MANIFEST_BRANCH }}
+          Device: ${{ env.DEVICE_NAME }}
+          Lunch: ${{ env.MAKEFILE_NAME }}
+          Device tree branch: ${{ env.DEVICE_TREE_BRANCH }}
+          Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_WEB }}/tree/${{ steps.devtree_commit.outputs.commit }})
+          bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://gitlab.com/OrangeFox/bootable/Recovery/tree/${{ steps.recovery_commit.outputs.commit }})
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
