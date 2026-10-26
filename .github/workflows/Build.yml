@@ -183,6 +183,75 @@ jobs:
         sed -i 's#mPersist.SetValue(TW_UNMOUNT_VENDOR, "1");#mPersist.SetValue(TW_UNMOUNT_VENDOR, "0");#' "$f"
         grep -n 'mPersist.SetValue(TW_UNMOUNT_VENDOR, "0");' "$f"
 
+    - name: Blank screen on boot only for non-NVT panels
+      run: |
+        # TW_SCREEN_BLANK_ON_BOOT (gui/gui.cpp, gui_init) blanks and unblanks
+        # the panel at recovery start. FTS panels (m19_42_*) need that, but on
+        # NVT panels (m19_36_*) it collides with the touch-FW load and breaks
+        # the display. Keep the flag true in BoardConfig; skip the cycle at
+        # runtime when an NVT panel is detected:
+        #   1) /proc/cmdline msm_drm.dsi_display0=...m19_36 / m19_42...
+        #   2) fallback: /proc/NVTSPI or /proc/nvt_fw_version exists
+        python3 - <<'PY'
+        import re, sys
+        from pathlib import Path
+
+        f = Path("fox_${{ env.MANIFEST_BRANCH }}/bootable/recovery/gui/gui.cpp")
+        s = f.read_text()
+        if "OF_NVT_BLANK_ON_BOOT_PATCH" in s:
+            sys.exit(0)
+
+        helper = '''/* OF_NVT_BLANK_ON_BOOT_PATCH */
+        static bool of_panel_is_nvt(void)
+        {
+        	char b[4096] = {0};
+        	FILE *f = fopen("/proc/cmdline", "r");
+        	if (f) {
+        		size_t n = fread(b, 1, sizeof(b) - 1, f);
+        		b[n] = 0;
+        		fclose(f);
+        		if (strstr(b, "m19_36") || strstr(b, "n19_36"))
+        			return true;
+        		if (strstr(b, "m19_42") || strstr(b, "n19_42"))
+        			return false;
+        	}
+        	return access("/proc/NVTSPI", F_OK) == 0 ||
+        		access("/proc/nvt_fw_version", F_OK) == 0;
+        }
+
+        '''
+        helper = "\n".join(l[8:] if l.startswith("        ") else l for l in helper.split("\n"))
+
+        # 1) helper right before gui_init
+        anchor = 'extern "C" int gui_init(void)'
+        if s.count(anchor) != 1:
+            sys.exit("::error::gui_init anchor not found exactly once")
+        s = s.replace(anchor, helper + anchor, 1)
+
+        # 2) wrap the blank/unblank cycle
+        pat = re.compile(
+            r'(#ifdef TW_SCREEN_BLANK_ON_BOOT\s*\n)'
+            r'(\s*printf\("TW_SCREEN_BLANK_ON_BOOT := true\\n"\);\s*\n)'
+            r'(\s*blankTimer\.blank\(\);\s*\n)'
+            r'(\s*blankTimer\.resetTimerAndUnblank\(\);\s*\n)'
+            r'(#endif)')
+        m = pat.search(s)
+        if not m:
+            sys.exit("::error::TW_SCREEN_BLANK_ON_BOOT block in gui_init changed, update the patch")
+        new = (m.group(1) +
+               "\tif (of_panel_is_nvt()) {\n"
+               "\t\tprintf(\"NVT panel detected, skipping blank-on-boot\\n\");\n"
+               "\t} else {\n"
+               "\t\tprintf(\"TW_SCREEN_BLANK_ON_BOOT := true\\n\");\n"
+               "\t\tblankTimer.blank();\n"
+               "\t\tblankTimer.resetTimerAndUnblank();\n"
+               "\t}\n" + m.group(5))
+        s = s[:m.start()] + new + s[m.end():]
+        f.write_text(s)
+        print("patched", f)
+        PY
+        grep -n -B2 -A12 "of_panel_is_nvt()" "fox_${{ env.MANIFEST_BRANCH }}/bootable/recovery/gui/gui.cpp"
+
     - name: Prefer the classic zip signer
       run: |
         # zipsigner-3.0.jar rebuilds the whole archive through libziparchive,
